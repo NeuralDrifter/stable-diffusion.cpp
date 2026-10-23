@@ -1688,6 +1688,16 @@ protected:
     ggml_context* compute_ctx    = nullptr;
     ggml_gallocr* compute_allocr = nullptr;
 
+    // -----------------------------------------------------------------------
+    // Multi-GPU tensor-split support
+    // Author: Michael Burgus <https://github.com/NeuralDrifter>
+    // -----------------------------------------------------------------------
+    std::vector<ggml_backend_t>        split_backends_;
+    std::vector<ggml_backend_buffer_t> split_params_buffers_;
+    ggml_backend_sched_t               sched_           = nullptr;
+    ggml_backend_t                     sched_cpu_       = nullptr;
+    bool                               sched_reserved_  = false;
+
     std::shared_ptr<WeightAdapter> weight_adapter = nullptr;
 
     std::vector<float> one_vec = {1.f};
@@ -1798,6 +1808,27 @@ protected:
     }
 
     bool alloc_compute_buffer(get_graph_cb_t get_graph) {
+        // Multi-GPU sched path
+        if (sched_) {
+            if (sched_reserved_) return true;
+            reset_compute_ctx();
+            ggml_cgraph* gf = get_compute_graph(get_graph);
+            backend_tensor_data_map.clear();
+            if (!ggml_backend_sched_reserve(sched_, gf)) {
+                LOG_ERROR("%s: failed to reserve multi-GPU sched", get_desc().c_str());
+                return false;
+            }
+            for (int i = 0; i < (int)split_backends_.size(); i++) {
+                size_t sz = ggml_backend_sched_get_buffer_size(sched_, split_backends_[i]);
+                if (sz > 0) {
+                    LOG_DEBUG("%s sched compute GPU%d: %.2f MB",
+                              get_desc().c_str(), i, sz / 1024.f / 1024.f);
+                }
+            }
+            sched_reserved_ = true;
+            return true;
+        }
+
         if (compute_allocr != nullptr) {
             return true;
         }
@@ -1964,11 +1995,39 @@ public:
         }
     }
 
+    // Multi-GPU constructor: splits model weights across multiple backends.
+    // Blocks are distributed proportionally across backends by name
+    // (double_blocks.N and single_blocks.N). All other tensors go to backend 0.
+    // Author: Michael Burgus <https://github.com/NeuralDrifter>
+    GGMLRunner(std::vector<ggml_backend_t> backends, bool /*offload_params_to_cpu*/ = false)
+        : runtime_backend(backends.empty() ? nullptr : backends[0]),
+          split_backends_(backends) {
+        alloc_params_ctx();
+        params_backend = runtime_backend;  // params live on GPU backends directly
+
+        // Build scheduler: all GPU backends + CPU fallback
+        sched_cpu_ = ggml_backend_cpu_init();
+        std::vector<ggml_backend_t> sched_bes = backends;
+        sched_bes.push_back(sched_cpu_);
+        sched_ = ggml_backend_sched_new(sched_bes.data(), nullptr,
+                                        (int)sched_bes.size(),
+                                        GGML_DEFAULT_GRAPH_SIZE, false, true);
+    }
+
     virtual ~GGMLRunner() {
         free_params_buffer();
         free_compute_buffer();
         free_params_ctx();
         free_compute_ctx();
+        // Sched cleanup
+        if (sched_) {
+            ggml_backend_sched_free(sched_);
+            sched_ = nullptr;
+        }
+        if (sched_cpu_) {
+            ggml_backend_free(sched_cpu_);
+            sched_cpu_ = nullptr;
+        }
         if (params_backend != runtime_backend) {
             ggml_backend_free(params_backend);
         }
@@ -1993,6 +2052,9 @@ public:
     }
 
     bool alloc_params_buffer() {
+        if (!split_backends_.empty()) {
+            return alloc_params_buffer_split();
+        }
         size_t num_tensors = ggml_tensor_num(params_ctx);
         params_buffer      = ggml_backend_alloc_ctx_tensors(params_ctx, params_backend);
         if (params_buffer == nullptr) {
@@ -2015,6 +2077,105 @@ public:
             ggml_backend_buffer_free(params_buffer);
             params_buffer = nullptr;
         }
+        // Free additional split buffers (buffer[0] == params_buffer, already freed above)
+        for (size_t i = 1; i < split_params_buffers_.size(); i++) {
+            if (split_params_buffers_[i]) {
+                ggml_backend_buffer_free(split_params_buffers_[i]);
+                split_params_buffers_[i] = nullptr;
+            }
+        }
+        split_params_buffers_.clear();
+    }
+
+    // Returns which backend index [0, n_be-1] a tensor should be assigned to.
+    // double_blocks.N and single_blocks.N are split proportionally across GPUs.
+    // All other tensors (global weights, embed layers, final_layer) go to GPU 0.
+    // Author: Michael Burgus <https://github.com/NeuralDrifter>
+    static int get_split_backend_idx(const char* name, int n_be, int n_double, int n_single) {
+        if (n_be <= 1 || (n_double + n_single) == 0) return 0;
+        int total = n_double + n_single;
+
+        const char* db = strstr(name, "double_blocks.");
+        if (db) {
+            int blk = atoi(db + 14);
+            return std::min((blk * n_be) / total, n_be - 1);
+        }
+        const char* sb = strstr(name, "single_blocks.");
+        if (sb) {
+            int blk = atoi(sb + 14);
+            return std::min(((n_double + blk) * n_be) / total, n_be - 1);
+        }
+        return 0;
+    }
+
+    // Allocates model weights across multiple GPU backends.
+    // Must only be called when split_backends_ has >= 2 entries.
+    bool alloc_params_buffer_split() {
+        int n_be = (int)split_backends_.size();
+
+        // Pass 1: discover total block counts by scanning tensor names
+        int n_double = 0, n_single = 0;
+        for (auto* t = ggml_get_first_tensor(params_ctx); t; t = ggml_get_next_tensor(params_ctx, t)) {
+            if (t->data || t->view_src) continue;
+            const char* db = strstr(t->name, "double_blocks.");
+            if (db) n_double = std::max(n_double, atoi(db + 14) + 1);
+            const char* sb = strstr(t->name, "single_blocks.");
+            if (sb) n_single = std::max(n_single, atoi(sb + 14) + 1);
+        }
+        LOG_INFO("Multi-GPU split: %d double + %d single blocks across %d GPUs",
+                 n_double, n_single, n_be);
+
+        // Pass 2: accumulate byte count per backend
+        std::vector<size_t> be_sizes(n_be, 0);
+        std::vector<size_t> be_aligns(n_be);
+        for (int i = 0; i < n_be; i++) {
+            be_aligns[i] = ggml_backend_buft_get_alignment(
+                ggml_backend_get_default_buffer_type(split_backends_[i]));
+        }
+        for (auto* t = ggml_get_first_tensor(params_ctx); t; t = ggml_get_next_tensor(params_ctx, t)) {
+            if (t->data || t->view_src) continue;
+            int bi = get_split_backend_idx(t->name, n_be, n_double, n_single);
+            be_sizes[bi] += GGML_PAD(ggml_nbytes(t), be_aligns[bi]);
+        }
+
+        // Allocate one buffer per backend
+        split_params_buffers_.resize(n_be, nullptr);
+        std::vector<uint8_t*> be_bases(n_be, nullptr);
+        std::vector<size_t>   be_offsets(n_be, 0);
+
+        for (int i = 0; i < n_be; i++) {
+            if (be_sizes[i] == 0) {
+                LOG_DEBUG("Split GPU%d: no tensors", i);
+                continue;
+            }
+            auto buft = ggml_backend_get_default_buffer_type(split_backends_[i]);
+            split_params_buffers_[i] = ggml_backend_buft_alloc_buffer(buft, be_sizes[i]);
+            if (!split_params_buffers_[i]) {
+                LOG_ERROR("Failed to alloc split params buffer for GPU%d (%.2f MB)",
+                          i, be_sizes[i] / 1024.f / 1024.f);
+                return false;
+            }
+            be_bases[i] = (uint8_t*)ggml_backend_buffer_get_base(split_params_buffers_[i]);
+            LOG_INFO("  GPU%d params: %.2f MB", i, be_sizes[i] / 1024.f / 1024.f);
+        }
+
+        // Pass 3: assign each tensor to its buffer
+        for (auto* t = ggml_get_first_tensor(params_ctx); t; t = ggml_get_next_tensor(params_ctx, t)) {
+            if (t->data || t->view_src) continue;
+            int bi = get_split_backend_idx(t->name, n_be, n_double, n_single);
+            if (!split_params_buffers_[bi]) continue;
+            t->data = be_bases[bi] + be_offsets[bi];
+            ggml_backend_buffer_init_tensor(split_params_buffers_[bi], t);
+            be_offsets[bi] += GGML_PAD(ggml_nbytes(t), be_aligns[bi]);
+        }
+
+        // compat: params_buffer points to GPU0 buffer
+        params_buffer = split_params_buffers_[0];
+
+        size_t total = 0;
+        for (auto s : be_sizes) total += s;
+        LOG_DEBUG("Split params total: %.2f MB", total / 1024.f / 1024.f);
+        return true;
     }
 
     size_t get_params_buffer_size() {
@@ -2030,6 +2191,13 @@ public:
     }
 
     void free_compute_buffer() {
+        if (sched_) {
+            if (sched_reserved_) {
+                ggml_backend_sched_reset(sched_);
+                sched_reserved_ = false;
+            }
+            return;
+        }
         if (compute_allocr != nullptr) {
             ggml_gallocr_free(compute_allocr);
             compute_allocr = nullptr;
@@ -2085,6 +2253,41 @@ public:
         }
         reset_compute_ctx();
         ggml_cgraph* gf = get_compute_graph(get_graph);
+        if (sched_) {
+            // Multi-GPU sched compute path
+            if (!ggml_backend_sched_alloc_graph(sched_, gf)) {
+                LOG_ERROR("%s: sched alloc graph failed", get_desc().c_str());
+                return false;
+            }
+            copy_data_to_backend_tensor();
+
+            ggml_status status = ggml_backend_sched_graph_compute(sched_, gf);
+            if (status != GGML_STATUS_SUCCESS) {
+                LOG_ERROR("%s: sched compute failed: %s",
+                          get_desc().c_str(), ggml_status_to_string(status));
+                return false;
+            }
+#ifdef GGML_PERF
+            ggml_graph_print(gf);
+#endif
+            copy_cache_tensors_to_cache_buffer();
+            if (output != nullptr) {
+                auto result = ggml_get_tensor(compute_ctx, final_result_name.c_str());
+                if (*output == nullptr && output_ctx != nullptr) {
+                    *output = ggml_dup_tensor(output_ctx, result);
+                }
+                if (*output != nullptr) {
+                    // ggml_backend_tensor_get works for any backend - no sync needed here
+                    // as ggml_backend_sched_graph_compute already synchronizes all backends
+                    ggml_backend_tensor_get(result, (*output)->data, 0, ggml_nbytes(*output));
+                }
+            }
+            if (free_compute_buffer_immediately) {
+                free_compute_buffer();
+            }
+            return true;
+        }
+
         if (!ggml_gallocr_alloc_graph(compute_allocr, gf)) {
             LOG_ERROR("%s alloc compute graph failed", get_desc().c_str());
             return false;

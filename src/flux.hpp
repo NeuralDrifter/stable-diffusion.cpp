@@ -1295,12 +1295,190 @@ namespace Flux {
             flux.init(params_ctx, tensor_storage_map, prefix);
         }
 
+        // Multi-GPU split constructor - same init as single-GPU but uses GGMLRunner multi-backend.
+        // Usage: set SD_VK_SPLIT=1 to activate. offload_params_to_cpu is ignored in split mode
+        // (params live directly on the GPU backends).
+        // Author: Michael Burgus <https://github.com/NeuralDrifter>
+        FluxRunner(std::vector<ggml_backend_t> backends,
+                   const String2TensorStorage& tensor_storage_map = {},
+                   const std::string prefix                       = "",
+                   SDVersion version_arg                          = VERSION_FLUX,
+                   bool use_mask_arg                              = false)
+            : GGMLRunner(backends), version(version_arg), use_mask(use_mask_arg) {
+            flux_params.version             = version;
+            flux_params.guidance_embed      = false;
+            flux_params.depth               = 0;
+            flux_params.depth_single_blocks = 0;
+            if (version == VERSION_FLUX_FILL) {
+                flux_params.in_channels = 384;
+            } else if (version == VERSION_FLUX_CONTROLS) {
+                flux_params.in_channels = 128;
+            } else if (version == VERSION_FLEX_2) {
+                flux_params.in_channels = 196;
+            } else if (version == VERSION_CHROMA_RADIANCE) {
+                flux_params.in_channels = 3;
+                flux_params.patch_size  = 16;
+            } else if (version == VERSION_OVIS_IMAGE) {
+                flux_params.semantic_txt_norm = true;
+                flux_params.use_yak_mlp       = true;
+                flux_params.vec_in_dim        = 0;
+            } else if (sd_version_is_flux2(version)) {
+                flux_params.in_channels      = 128;
+                flux_params.patch_size       = 1;
+                flux_params.out_channels     = 128;
+                flux_params.mlp_ratio        = 3.f;
+                flux_params.theta            = 2000;
+                flux_params.axes_dim         = {32, 32, 32, 32};
+                flux_params.vec_in_dim       = 0;
+                flux_params.qkv_bias         = false;
+                flux_params.disable_bias     = true;
+                flux_params.share_modulation = true;
+                flux_params.ref_index_scale  = 10.f;
+                flux_params.use_mlp_silu_act = true;
+            }
+            int64_t head_dim                   = 0;
+            int64_t actual_radiance_patch_size = -1;
+            for (auto pair : tensor_storage_map) {
+                std::string tensor_name = pair.first;
+                if (!starts_with(tensor_name, prefix))
+                    continue;
+                if (tensor_name.find("guidance_in.in_layer.weight") != std::string::npos) {
+                    flux_params.guidance_embed = true;
+                }
+                if (tensor_name.find("__x0__") != std::string::npos) {
+                    LOG_DEBUG("using x0 prediction");
+                    flux_params.chroma_radiance_params.use_x0 = true;
+                }
+                if (tensor_name.find("__32x32__") != std::string::npos) {
+                    LOG_DEBUG("using patch size 32");
+                    flux_params.patch_size = 32;
+                }
+                if (tensor_name.find("img_in_patch.weight") != std::string::npos) {
+                    actual_radiance_patch_size = pair.second.ne[0];
+                    LOG_DEBUG("actual radiance patch size: %d", actual_radiance_patch_size);
+                }
+                if (tensor_name.find("distilled_guidance_layer.in_proj.weight") != std::string::npos) {
+                    flux_params.is_chroma = true;
+                }
+                size_t db = tensor_name.find("double_blocks.");
+                if (db != std::string::npos) {
+                    tensor_name     = tensor_name.substr(db);
+                    int block_depth = atoi(tensor_name.substr(14, tensor_name.find(".", 14)).c_str());
+                    if (block_depth + 1 > flux_params.depth) {
+                        flux_params.depth = block_depth + 1;
+                    }
+                }
+                size_t sb = tensor_name.find("single_blocks.");
+                if (sb != std::string::npos) {
+                    tensor_name     = tensor_name.substr(sb);
+                    int block_depth = atoi(tensor_name.substr(14, tensor_name.find(".", 14)).c_str());
+                    if (block_depth + 1 > flux_params.depth_single_blocks) {
+                        flux_params.depth_single_blocks = block_depth + 1;
+                    }
+                }
+                if (ends_with(tensor_name, "txt_in.weight")) {
+                    flux_params.context_in_dim = pair.second.ne[0];
+                    flux_params.hidden_size    = pair.second.ne[1];
+                }
+                if (ends_with(tensor_name, "single_blocks.0.norm.key_norm.scale")) {
+                    head_dim = pair.second.ne[0];
+                }
+                if (ends_with(tensor_name, "double_blocks.0.txt_attn.norm.key_norm.scale")) {
+                    head_dim = pair.second.ne[0];
+                }
+            }
+            if (actual_radiance_patch_size > 0 && actual_radiance_patch_size != flux_params.patch_size) {
+                GGML_ASSERT(flux_params.patch_size == 2 * actual_radiance_patch_size);
+                LOG_DEBUG("using fake x2 patch size");
+                flux_params.chroma_radiance_params.fake_patch_size_x2 = true;
+            }
+            flux_params.num_heads = static_cast<int>(flux_params.hidden_size / head_dim);
+            LOG_INFO("flux (split): depth = %d, depth_single_blocks = %d, guidance_embed = %s, context_in_dim = %" PRId64
+                     ", hidden_size = %" PRId64 ", num_heads = %d",
+                     flux_params.depth,
+                     flux_params.depth_single_blocks,
+                     flux_params.guidance_embed ? "true" : "false",
+                     flux_params.context_in_dim,
+                     flux_params.hidden_size,
+                     flux_params.num_heads);
+            if (flux_params.is_chroma) {
+                LOG_INFO("Using pruned modulation (Chroma)");
+            }
+            flux = Flux(flux_params);
+            flux.init(params_ctx, tensor_storage_map, prefix);
+        }
+
         std::string get_desc() override {
             return "flux";
         }
 
         void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors, const std::string prefix) {
             flux.get_param_tensors(tensors, prefix);
+        }
+
+        // Override alloc_params_buffer for the multi-GPU split path.
+        // Uses get_param_tensors() for full path names (e.g. "model.diffusion_model.double_blocks.0...")
+        // to route tensors to backends, then allocates via ggml_tallocr (the same allocator ggml uses
+        // internally) so buffer init is handled identically to the single-GPU path.
+        // Author: Michael Burgus <https://github.com/NeuralDrifter>
+        bool alloc_params_buffer() {
+            if (split_backends_.size() <= 1) {
+                return GGMLRunner::alloc_params_buffer();
+            }
+
+            int n_be     = (int)split_backends_.size();
+            int n_double = flux_params.depth;
+            int n_single = flux_params.depth_single_blocks;
+
+            LOG_INFO("Multi-GPU split: %d double + %d single blocks across %d GPUs",
+                     n_double, n_single, n_be);
+
+            std::map<std::string, ggml_tensor*> tensor_map;
+            flux.get_param_tensors(tensor_map, "model.diffusion_model");
+
+            // Pass 1: compute required buffer size per backend
+            std::vector<size_t> be_sizes(n_be, 0);
+            for (auto& kv : tensor_map) {
+                int bi       = get_split_backend_idx(kv.first.c_str(), n_be, n_double, n_single);
+                auto buft    = ggml_backend_get_default_buffer_type(split_backends_[bi]);
+                size_t align = ggml_backend_buft_get_alignment(buft);
+                be_sizes[bi] += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, kv.second), align);
+            }
+
+            // Pass 2: allocate one buffer per backend
+            split_params_buffers_.resize(n_be, nullptr);
+            for (int i = 0; i < n_be; i++) {
+                if (be_sizes[i] == 0) { LOG_DEBUG("Split GPU%d: no tensors", i); continue; }
+                auto buft                = ggml_backend_get_default_buffer_type(split_backends_[i]);
+                split_params_buffers_[i] = ggml_backend_buft_alloc_buffer(buft, be_sizes[i]);
+                if (!split_params_buffers_[i]) {
+                    LOG_ERROR("Failed to alloc split params buffer for GPU%d (%.2f MB)",
+                              i, be_sizes[i] / 1024.f / 1024.f);
+                    return false;
+                }
+                LOG_INFO("  GPU%d params: %.2f MB", i, be_sizes[i] / 1024.f / 1024.f);
+            }
+
+            // Pass 3: assign tensors using ggml_tallocr (identical to ggml_backend_alloc_ctx_tensors)
+            std::vector<ggml_tallocr> tallocrs(n_be);
+            for (int i = 0; i < n_be; i++) {
+                if (split_params_buffers_[i]) {
+                    tallocrs[i] = ggml_tallocr_new(split_params_buffers_[i]);
+                }
+            }
+            for (auto& kv : tensor_map) {
+                ggml_tensor* t = kv.second;
+                if (t->data || t->view_src) continue;
+                int bi = get_split_backend_idx(kv.first.c_str(), n_be, n_double, n_single);
+                if (!split_params_buffers_[bi]) continue;
+                ggml_tallocr_alloc(&tallocrs[bi], t);
+            }
+
+            params_buffer = split_params_buffers_[0];
+            size_t total = 0;
+            for (auto s : be_sizes) total += s;
+            LOG_INFO("Split params total: %.2f MB", total / 1024.f / 1024.f);
+            return true;
         }
 
         std::vector<float> fetch_dct_pos(int patch_size, int max_freqs) {

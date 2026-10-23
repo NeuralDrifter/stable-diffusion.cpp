@@ -184,6 +184,16 @@ struct FluxModel : public DiffusionModel {
         : flux(backend, offload_params_to_cpu, tensor_storage_map, "model.diffusion_model", version, use_mask) {
     }
 
+    // Multi-GPU constructor: distributes transformer blocks across all provided backends.
+    // Usage: set SD_VK_SPLIT=1 to activate. offload_params_to_cpu is ignored in split mode
+    // (params live directly on the GPU backends).
+    FluxModel(std::vector<ggml_backend_t> backends,
+              const String2TensorStorage& tensor_storage_map = {},
+              SDVersion version                              = VERSION_FLUX,
+              bool use_mask                                  = false)
+        : flux(backends, tensor_storage_map, "model.diffusion_model", version, use_mask) {
+    }
+
     std::string get_desc() override {
         return flux.get_desc();
     }

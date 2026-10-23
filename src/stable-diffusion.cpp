@@ -480,10 +480,13 @@ static void log_sample_cache_summary(const SampleCacheRuntime& runtime, size_t t
 
 class StableDiffusionGGML {
 public:
-    ggml_backend_t backend             = nullptr;  // general backend
+    ggml_backend_t backend             = nullptr;  // general backend (GPU 0 in split mode)
     ggml_backend_t clip_backend        = nullptr;
     ggml_backend_t control_net_backend = nullptr;
     ggml_backend_t vae_backend         = nullptr;
+    // Multi-GPU tensor-split support — Author: Michael Burgus <https://github.com/NeuralDrifter>
+    std::vector<ggml_backend_t> vk_backends_;  // all VK backends when split mode active
+    size_t model_vram_size_hint_ = 0;          // diffusion model VRAM footprint, set before init_backend()
 
     SDVersion version;
     bool vae_decode_only         = false;
@@ -540,6 +543,10 @@ public:
         if (vae_backend != backend) {
             ggml_backend_free(vae_backend);
         }
+        // In split mode, vk_backends_[0] == backend; free remaining
+        for (size_t i = 1; i < vk_backends_.size(); i++) {
+            ggml_backend_free(vk_backends_[i]);
+        }
         ggml_backend_free(backend);
     }
 
@@ -557,25 +564,86 @@ public:
         size_t device          = 0;
         const int device_count = ggml_backend_vk_get_device_count();
         if (device_count) {
+            // SD_VK_SPLIT multi-GPU path — Author: Michael Burgus <https://github.com/NeuralDrifter>
+            const char* SD_VK_SPLIT  = getenv("SD_VK_SPLIT");
             const char* SD_VK_DEVICE = getenv("SD_VK_DEVICE");
-            if (SD_VK_DEVICE != nullptr) {
-                std::string sd_vk_device_str = SD_VK_DEVICE;
-                try {
-                    device = std::stoull(sd_vk_device_str);
-                } catch (const std::invalid_argument&) {
-                    LOG_WARN("SD_VK_DEVICE environment variable is not a valid integer (%s). Falling back to device 0.", SD_VK_DEVICE);
-                    device = 0;
-                } catch (const std::out_of_range&) {
-                    LOG_WARN("SD_VK_DEVICE environment variable value is out of range for `unsigned long long` type (%s). Falling back to device 0.", SD_VK_DEVICE);
-                    device = 0;
+
+            // Auto-split: activate split if GPU0 free VRAM < model_vram_threshold and
+            // multiple discrete GPUs are available.  SD_VK_SPLIT=1 also forces split.
+            // Author: Michael Burgus <https://github.com/NeuralDrifter>
+            auto enumerate_split_backends = [&]() {
+                for (int i = 0; i < device_count; i++) {
+                    if (ggml_backend_vk_device_is_integrated(i)) {
+                        char desc[256];
+                        ggml_backend_vk_get_device_description(i, desc, sizeof(desc));
+                        LOG_INFO("Vulkan split: skipping integrated GPU %d = %s", i, desc);
+                        continue;
+                    }
+                    ggml_backend_t vk_be = ggml_backend_vk_init(i);
+                    if (vk_be) {
+                        size_t free_mem = 0, total_mem = 0;
+                        ggml_backend_vk_get_device_memory(i, &free_mem, &total_mem);
+                        char desc[256];
+                        ggml_backend_vk_get_device_description(i, desc, sizeof(desc));
+                        LOG_INFO("Vulkan split: device %d = %s (%.1f GB total, %.1f GB free)",
+                                 i, desc, total_mem / 1024.f / 1024.f / 1024.f,
+                                 free_mem / 1024.f / 1024.f / 1024.f);
+                        vk_backends_.push_back(vk_be);
+                    }
                 }
-                if (device >= device_count) {
-                    LOG_WARN("Cannot find targeted vulkan device (%llu). Falling back to device 0.", device);
-                    device = 0;
+                if (!vk_backends_.empty()) {
+                    backend = vk_backends_[0];
                 }
+            };
+
+            // Count discrete GPUs available for potential split
+            int discrete_count = 0;
+            for (int i = 0; i < device_count; i++) {
+                if (!ggml_backend_vk_device_is_integrated(i)) discrete_count++;
             }
-            LOG_INFO("Vulkan: Using device %llu", device);
-            backend = ggml_backend_vk_init(device);
+
+            if (SD_VK_SPLIT != nullptr && device_count > 1) {
+                // Explicit split request
+                enumerate_split_backends();
+            } else if (SD_VK_DEVICE == nullptr && discrete_count > 1) {
+                // Auto mode with multiple discrete GPUs: split if GPU0 is too small.
+                // Use 80% of free VRAM as threshold — compute buffers typically add ~33%
+                // on top of model size, so 80% catches models that would OOM at runtime.
+                size_t gpu0_free = 0, gpu0_total = 0;
+                ggml_backend_vk_get_device_memory(0, &gpu0_free, &gpu0_total);
+                const size_t threshold  = (size_t)(gpu0_free * 0.80);
+                const size_t model_vram = model_vram_size_hint_;
+                if (model_vram > 0 && model_vram > threshold) {
+                    LOG_INFO("Auto split: model (%.1f GB) exceeds GPU0 threshold (%.1f GB of %.1f GB free) — activating multi-GPU split",
+                             model_vram / 1024.f / 1024.f / 1024.f,
+                             threshold  / 1024.f / 1024.f / 1024.f,
+                             gpu0_free  / 1024.f / 1024.f / 1024.f);
+                    enumerate_split_backends();
+                } else {
+                    LOG_INFO("Vulkan: Using device 0 (auto)");
+                    backend = ggml_backend_vk_init(0);
+                }
+            } else {
+                // Single device (existing behaviour)
+                if (SD_VK_DEVICE != nullptr) {
+                    std::string sd_vk_device_str = SD_VK_DEVICE;
+                    try {
+                        device = std::stoull(sd_vk_device_str);
+                    } catch (const std::invalid_argument&) {
+                        LOG_WARN("SD_VK_DEVICE environment variable is not a valid integer (%s). Falling back to device 0.", SD_VK_DEVICE);
+                        device = 0;
+                    } catch (const std::out_of_range&) {
+                        LOG_WARN("SD_VK_DEVICE environment variable value is out of range for `unsigned long long` type (%s). Falling back to device 0.", SD_VK_DEVICE);
+                        device = 0;
+                    }
+                    if (device >= (size_t)device_count) {
+                        LOG_WARN("Cannot find targeted vulkan device (%llu). Falling back to device 0.", device);
+                        device = 0;
+                    }
+                }
+                LOG_INFO("Vulkan: Using device %llu", device);
+                backend = ggml_backend_vk_init(device);
+            }
         }
         if (!backend) {
             LOG_WARN("Failed to initialize Vulkan backend");
@@ -626,8 +694,6 @@ public:
         }
 
         ggml_log_set(ggml_log_callback_default, nullptr);
-
-        init_backend();
 
         ModelLoader model_loader;
 
@@ -724,6 +790,22 @@ public:
         }
 
         auto& tensor_storage_map = model_loader.get_tensor_storage_map();
+
+        // Compute diffusion model VRAM footprint so init_backend() can decide auto-split.
+        // Author: Michael Burgus <https://github.com/NeuralDrifter>
+        {
+            const char* pfx = "model.diffusion_model.";
+            size_t pfx_len  = strlen(pfx);
+            for (auto& kv : tensor_storage_map) {
+                if (kv.first.size() > pfx_len &&
+                    kv.first.compare(0, pfx_len, pfx) == 0) {
+                    model_vram_size_hint_ += (size_t)kv.second.nbytes();
+                }
+            }
+            LOG_INFO("Diffusion model VRAM hint: %.2f MB", model_vram_size_hint_ / 1024.f / 1024.f);
+        }
+
+        init_backend();
 
         LOG_INFO("Version: %s ", model_version_to_str[version]);
         ggml_type wtype               = (int)sd_ctx_params->wtype < std::min<int>(SD_TYPE_COUNT, GGML_TYPE_COUNT)
@@ -848,22 +930,36 @@ public:
                                                                           offload_params_to_cpu,
                                                                           tensor_storage_map);
                 }
-                diffusion_model = std::make_shared<FluxModel>(backend,
-                                                              offload_params_to_cpu,
-                                                              tensor_storage_map,
-                                                              version,
-                                                              sd_ctx_params->chroma_use_dit_mask);
+                if (vk_backends_.size() > 1) {
+                    diffusion_model = std::make_shared<FluxModel>(vk_backends_,
+                                                                  tensor_storage_map,
+                                                                  version,
+                                                                  sd_ctx_params->chroma_use_dit_mask);
+                } else {
+                    diffusion_model = std::make_shared<FluxModel>(backend,
+                                                                  offload_params_to_cpu,
+                                                                  tensor_storage_map,
+                                                                  version,
+                                                                  sd_ctx_params->chroma_use_dit_mask);
+                }
             } else if (sd_version_is_flux2(version)) {
                 bool is_chroma   = false;
                 cond_stage_model = std::make_shared<LLMEmbedder>(clip_backend,
                                                                  offload_params_to_cpu,
                                                                  tensor_storage_map,
                                                                  version);
-                diffusion_model  = std::make_shared<FluxModel>(backend,
-                                                              offload_params_to_cpu,
-                                                              tensor_storage_map,
-                                                              version,
-                                                              sd_ctx_params->chroma_use_dit_mask);
+                if (vk_backends_.size() > 1) {
+                    diffusion_model = std::make_shared<FluxModel>(vk_backends_,
+                                                                  tensor_storage_map,
+                                                                  version,
+                                                                  sd_ctx_params->chroma_use_dit_mask);
+                } else {
+                    diffusion_model  = std::make_shared<FluxModel>(backend,
+                                                                  offload_params_to_cpu,
+                                                                  tensor_storage_map,
+                                                                  version,
+                                                                  sd_ctx_params->chroma_use_dit_mask);
+                }
             } else if (sd_version_is_wan(version)) {
                 cond_stage_model = std::make_shared<T5CLIPEmbedder>(clip_backend,
                                                                     offload_params_to_cpu,
@@ -1195,7 +1291,10 @@ public:
         if (version == VERSION_SVD) {
             ignore_tensors.insert("conditioner.embedders.3");
         }
-        bool success = model_loader.load_tensors(tensors, ignore_tensors, n_threads, sd_ctx_params->enable_mmap);
+        // In split mode, Vulkan device fences are not safe under concurrent thread access;
+        // force single-threaded loading to serialise all ggml_backend_tensor_set calls.
+        int load_threads = (!vk_backends_.empty()) ? 1 : n_threads;
+        bool success = model_loader.load_tensors(tensors, ignore_tensors, load_threads, sd_ctx_params->enable_mmap);
         if (!success) {
             LOG_ERROR("load tensors from model loader failed");
             ggml_free(ctx);
